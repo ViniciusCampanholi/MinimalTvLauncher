@@ -1,5 +1,7 @@
 package com.minimal.tvlauncher.data
 
+import android.app.Activity
+import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,12 +10,15 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.os.Build
 import android.provider.Settings
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import com.minimal.tvlauncher.model.AppInfo
+import com.minimal.tvlauncher.ui.WallpaperPreset
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.lsposed.hiddenapibypass.HiddenApiBypass
 
 class AppRepository(private val context: Context) {
 
@@ -43,7 +48,7 @@ class AppRepository(private val context: Context) {
         }
 
         uniquePackages.map { (pkg, resolveInfo) ->
-            val appLabel = resolveInfo.loadLabel(packageManager)?.toString() ?: pkg
+            val appLabel = resolveInfo.loadLabel(packageManager).toString().ifBlank { pkg }
             val iconDrawable = runCatching { resolveInfo.loadIcon(packageManager) }.getOrNull()
             val bannerDrawable = runCatching {
                 resolveInfo.activityInfo.loadBanner(packageManager)
@@ -92,6 +97,119 @@ class AppRepository(private val context: Context) {
         runCatching { context.startActivity(intent) }
     }
 
+    fun openWifiSettings() {
+        val wifiIntent = Intent(Settings.ACTION_WIFI_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val startedWifi = runCatching { context.startActivity(wifiIntent) }.isSuccess
+        if (!startedWifi) {
+            val wirelessIntent = Intent(Settings.ACTION_WIRELESS_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            val startedWireless = runCatching { context.startActivity(wirelessIntent) }.isSuccess
+            if (!startedWireless) {
+                openSystemSettings()
+            }
+        }
+    }
+
+    /**
+     * Ativa imediatamente o Protetor de Tela (Screensaver / Daydream / Ambient Mode) do Android TV.
+     */
+    fun startScreensaver() {
+        // 1. Tenta iniciar diretamente a Activity oficial do protetor de tela do Android (Somnambulator)
+        val somnambulatorIntent = Intent(Intent.ACTION_MAIN).apply {
+            setClassName("com.android.systemui", "com.android.systemui.Somnambulator")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (runCatching { context.startActivity(somnambulatorIntent) }.isSuccess) {
+            return
+        }
+
+        // 2. Tenta acionar o serviço de sistema IDreamManager.dream()
+        val dreamedViaManager = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                HiddenApiBypass.addHiddenApiExemptions("Landroid/os/ServiceManager;", "Landroid/service/dreams/")
+            }
+            val smClass = Class.forName("android.os.ServiceManager")
+            val getService = smClass.getMethod("getService", String::class.java)
+            val binder = getService.invoke(null, "dreams")
+            if (binder != null) {
+                val stubClass = Class.forName("android.service.dreams.IDreamManager\$Stub")
+                val asInterface = stubClass.getMethod("asInterface", Class.forName("android.os.IBinder"))
+                val dreamManager = asInterface.invoke(null, binder)
+                val dreamMethod = dreamManager.javaClass.getMethod("dream")
+                dreamMethod.invoke(dreamManager)
+                true
+            } else {
+                false
+            }
+        }.getOrDefault(false)
+
+        if (dreamedViaManager) return
+
+        // 3. Fallback: abre as configurações de protetor de tela caso a TV tenha desabilitado o Somnambulator
+        val dreamSettings = Intent(Settings.ACTION_DREAM_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        if (!runCatching { context.startActivity(dreamSettings) }.isSuccess) {
+            openSystemSettings()
+        }
+    }
+
+    fun getSelectedWallpaper(): WallpaperPreset {
+        val savedId = prefs.getString(KEY_SELECTED_WALLPAPER, WallpaperPreset.PURE_BLACK.id)
+        return WallpaperPreset.fromId(savedId)
+    }
+
+    fun setSelectedWallpaper(preset: WallpaperPreset) {
+        prefs.edit().putString(KEY_SELECTED_WALLPAPER, preset.id).apply()
+    }
+
+    fun isDefaultLauncher(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = context.getSystemService(Context.ROLE_SERVICE) as? RoleManager
+            if (roleManager != null && roleManager.isRoleAvailable(RoleManager.ROLE_HOME)) {
+                if (roleManager.isRoleHeld(RoleManager.ROLE_HOME)) return true
+            }
+        }
+        val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_HOME)
+        }
+        val resolveInfo = packageManager.resolveActivity(homeIntent, PackageManager.MATCH_DEFAULT_ONLY)
+        return resolveInfo?.activityInfo?.packageName == context.packageName
+    }
+
+    @Suppress("DEPRECATION")
+    fun promptSetDefaultLauncher(activity: Activity) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = context.getSystemService(Context.ROLE_SERVICE) as? RoleManager
+            if (roleManager != null &&
+                roleManager.isRoleAvailable(RoleManager.ROLE_HOME) &&
+                !roleManager.isRoleHeld(RoleManager.ROLE_HOME)
+            ) {
+                val roleIntent = roleManager.createRequestRoleIntent(RoleManager.ROLE_HOME)
+                val launched = runCatching {
+                    activity.startActivityForResult(roleIntent, 1001)
+                }.isSuccess
+                if (launched) return
+            }
+        }
+
+        val homeSettingsIntent = Intent(Settings.ACTION_HOME_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val openedHomeSettings = runCatching { context.startActivity(homeSettingsIntent) }.isSuccess
+        if (!openedHomeSettings) {
+            // Dispara o seletor de Home do Android
+            val chooserIntent = Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_HOME)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runCatching { context.startActivity(chooserIntent) }
+        }
+    }
+
     private fun Drawable.toImageBitmap(maxWidth: Int, maxHeight: Int): ImageBitmap {
         if (this is BitmapDrawable && bitmap != null) {
             return bitmap.asImageBitmap()
@@ -108,5 +226,6 @@ class AppRepository(private val context: Context) {
     companion object {
         private const val PREFS_NAME = "minimal_tv_launcher_prefs"
         private const val KEY_SELECTED_PACKAGES = "selected_packages"
+        private const val KEY_SELECTED_WALLPAPER = "selected_wallpaper"
     }
 }
