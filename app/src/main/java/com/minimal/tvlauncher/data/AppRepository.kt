@@ -25,7 +25,13 @@ class AppRepository(private val context: Context) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val packageManager: PackageManager = context.packageManager
 
-    suspend fun loadInstalledApps(): List<AppInfo> = withContext(Dispatchers.IO) {
+    @Volatile
+    private var cachedApps: List<AppInfo>? = null
+
+    @Volatile
+    private var cachedPackageNames: Set<String> = emptySet()
+
+    suspend fun loadInstalledApps(forceReload: Boolean = false): List<AppInfo> = withContext(Dispatchers.IO) {
         val selectedPackages = getSelectedPackages()
 
         // Busca apps otimizados para Android TV (Leanback) e apps Android padrão
@@ -47,7 +53,15 @@ class AppRepository(private val context: Context) {
             }
         }
 
-        uniquePackages.map { (pkg, resolveInfo) ->
+        val currentCache = cachedApps
+        if (!forceReload && currentCache != null && uniquePackages.keys == cachedPackageNames) {
+            return@withContext currentCache.map { app ->
+                val selected = selectedPackages.contains(app.packageName)
+                if (app.isSelected == selected) app else app.copy(isSelected = selected)
+            }
+        }
+
+        val loaded = uniquePackages.map { (pkg, resolveInfo) ->
             val appLabel = resolveInfo.loadLabel(packageManager).toString().ifBlank { pkg }
             val iconDrawable = runCatching { resolveInfo.loadIcon(packageManager) }.getOrNull()
             val bannerDrawable = runCatching {
@@ -58,11 +72,15 @@ class AppRepository(private val context: Context) {
             AppInfo(
                 packageName = pkg,
                 label = appLabel,
-                icon = iconDrawable?.toImageBitmap(maxWidth = 192, maxHeight = 192),
-                banner = bannerDrawable?.toImageBitmap(maxWidth = 320, maxHeight = 180),
+                icon = iconDrawable?.toImageBitmap(maxWidth = 144, maxHeight = 144),
+                banner = bannerDrawable?.toImageBitmap(maxWidth = 280, maxHeight = 158),
                 isSelected = selectedPackages.contains(pkg)
             )
         }.sortedBy { it.label.lowercase() }
+
+        cachedPackageNames = uniquePackages.keys.toSet()
+        cachedApps = loaded
+        loaded
     }
 
     fun getSelectedPackages(): Set<String> {
@@ -212,7 +230,17 @@ class AppRepository(private val context: Context) {
 
     private fun Drawable.toImageBitmap(maxWidth: Int, maxHeight: Int): ImageBitmap {
         if (this is BitmapDrawable && bitmap != null) {
-            return bitmap.asImageBitmap()
+            val src = bitmap
+            if (src.width <= maxWidth && src.height <= maxHeight) {
+                return src.asImageBitmap()
+            }
+            val scale = minOf(
+                maxWidth.toFloat() / src.width.coerceAtLeast(1),
+                maxHeight.toFloat() / src.height.coerceAtLeast(1)
+            )
+            val targetW = (src.width * scale).toInt().coerceAtLeast(1)
+            val targetH = (src.height * scale).toInt().coerceAtLeast(1)
+            return Bitmap.createScaledBitmap(src, targetW, targetH, true).asImageBitmap()
         }
         val width = if (intrinsicWidth > 0) intrinsicWidth.coerceAtMost(maxWidth) else maxWidth
         val height = if (intrinsicHeight > 0) intrinsicHeight.coerceAtMost(maxHeight) else maxHeight

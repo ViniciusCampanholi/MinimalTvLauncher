@@ -8,10 +8,12 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.LruCache
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -73,6 +75,7 @@ class YouTubeRepository(private val context: Context) {
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val accountManager = AccountManager.get(context)
+    private val thumbnailCache = LruCache<String, ImageBitmap>(48)
 
     fun isYouTubeBoxEnabled(): Boolean {
         return prefs.getBoolean(KEY_YOUTUBE_BOX_ENABLED, false)
@@ -1320,14 +1323,37 @@ class YouTubeRepository(private val context: Context) {
 
     private fun downloadImageBitmap(urlStr: String): ImageBitmap? {
         if (urlStr.isBlank()) return null
+        synchronized(thumbnailCache) {
+            thumbnailCache.get(urlStr)?.let { return it }
+        }
         return runCatching {
             val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
                 connectTimeout = 5000
                 readTimeout = 5000
             }
-            conn.inputStream.use { stream ->
-                BitmapFactory.decodeStream(stream)?.asImageBitmap()
+            val bytes = conn.inputStream.use { it.readBytes() }
+            val boundsOpts = BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
             }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, boundsOpts)
+
+            var sampleSize = 1
+            while (boundsOpts.outWidth / (sampleSize * 2) >= 320 &&
+                boundsOpts.outHeight / (sampleSize * 2) >= 180
+            ) {
+                sampleSize *= 2
+            }
+
+            val decodeOpts = BitmapFactory.Options().apply {
+                inSampleSize = sampleSize
+                inPreferredConfig = Bitmap.Config.RGB_565
+            }
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts) ?: return null
+            val imageBitmap = decoded.asImageBitmap()
+            synchronized(thumbnailCache) {
+                thumbnailCache.put(urlStr, imageBitmap)
+            }
+            imageBitmap
         }.getOrNull()
     }
 
